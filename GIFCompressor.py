@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import threading
 import json
-import uuid
+import tempfile
 import itertools
 
 GIF_FILE_TYPES = [("GIF files", "*.gif")]
@@ -238,15 +238,15 @@ class GIFCompressorApp:
         except Exception as e:
             self.log(f"Error displaying preview: {str(e)}")
 
-    def _try_compression_settings(
-            self, frames, skip_frames, colors, quality, resize_ratio, duration, output_path
+    def try_compression_settings(
+        self, frames, skip_frames, colors, resize_ratio, duration, output_path
     ):
         """Try compressing with given settings."""
         if not self.is_compressing:
             raise InterruptedError("Compression cancelled")
 
         self.progress_label.config(
-            text=f"Trying: {resize_ratio * 100:.0f}% resize, skip_frames={skip_frames}, {colors} colors, quality={quality}"
+            text=f"Trying: {resize_ratio * 100:.0f}% resize, skip_frames={skip_frames}, {colors} colors"
         )
         self.root.update_idletasks()
 
@@ -262,7 +262,12 @@ class GIFCompressorApp:
             optimized_frames.append(quantized_frame)
         self.log(f"Optimized with {colors} colors")
 
-        temp_path = str(output_path) + f".temp_{uuid.uuid4().hex}.gif"
+        # Create a secure temporary file path in the output directory
+        temp_dir = os.path.dirname(output_path) or "."
+        fd, temp_path = tempfile.mkstemp(
+            prefix="gifcompress_", suffix=".gif", dir=temp_dir
+        )
+        os.close(fd)  # Close the OS handle before PIL writes to the path on Windows
         optimized_frames[0].save(
             temp_path,
             save_all=True,
@@ -270,7 +275,8 @@ class GIFCompressorApp:
             duration=duration * 1000,
             loop=0,
             optimize=True,
-            quality=quality,
+            subrectangles=True,
+            dither=0,
         )
 
         if os.path.exists(temp_path):
@@ -279,7 +285,7 @@ class GIFCompressorApp:
             return output_size, optimized_frames, temp_path
         raise FileNotFoundError(f"Failed to create temporary GIF: {temp_path}")
 
-    def _get_cached_frames(self, resize_ratio, original_frames, frame_cache):
+    def get_cached_frames(self, resize_ratio, original_frames, frame_cache):
         """Get or create resized frames."""
         if resize_ratio in frame_cache:
             return frame_cache[resize_ratio]
@@ -299,25 +305,24 @@ class GIFCompressorApp:
 
         return frame_cache[resize_ratio]
 
-    def _process_compression_step(
-            self,
-            params,
-            frames,
-            duration,
-            output_path,
-            target_size,
-            tolerance,
-            successful_combinations,
+    def process_compression_step(
+        self,
+        params,
+        frames,
+        duration,
+        output_path,
+        target_size,
+        tolerance,
+        successful_combinations,
     ):
         """Process a single compression setting combination."""
-        skip_frames, colors, quality, resize_ratio = params
+        skip_frames, colors, resize_ratio = params
 
         try:
-            size, optimized_frames, temp_path = self._try_compression_settings(
+            size, optimized_frames, temp_path = self.try_compression_settings(
                 frames,
                 skip_frames,
                 colors,
-                quality,
                 resize_ratio,
                 duration,
                 output_path,
@@ -331,7 +336,6 @@ class GIFCompressorApp:
                         resize_ratio,
                         skip_frames,
                         colors,
-                        quality,
                         temp_path,
                     )
                 )
@@ -351,23 +355,19 @@ class GIFCompressorApp:
 
         return False
 
-    def _find_best_compression_combination(
-            self, original_frames, duration, max_size_mb, output_path
+    def find_best_compression_combination(
+        self, original_frames, duration, max_size_mb, output_path
     ):
         """Iterate through compression strategies to find the best combination."""
         resize_ratios = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5]
         colors_options = [256, 128, 64]
-        quality_options = [100, 60, 20]
         skip_frames_options = [False, True]
         target_size = max_size_mb * 1024 * 1024
         tolerance = 0.05 * target_size
         successful_combinations = []
 
         total_iterations = (
-                len(resize_ratios)
-                * len(skip_frames_options)
-                * len(colors_options)
-                * len(quality_options)
+            len(resize_ratios) * len(skip_frames_options) * len(colors_options)
         )
         current_iteration = 0
         frame_cache = {}
@@ -377,10 +377,10 @@ class GIFCompressorApp:
                 break
 
             self.log(f"Processing resize_ratio={resize_ratio * 100:.1f}%")
-            frames = self._get_cached_frames(resize_ratio, original_frames, frame_cache)
+            frames = self.get_cached_frames(resize_ratio, original_frames, frame_cache)
 
-            for skip_frames, colors, quality in itertools.product(
-                    skip_frames_options, colors_options, quality_options
+            for skip_frames, colors in itertools.product(
+                skip_frames_options, colors_options
             ):
                 if not self.is_compressing:
                     break
@@ -388,8 +388,8 @@ class GIFCompressorApp:
                 current_iteration += 1
                 self.progress["value"] = (current_iteration / total_iterations) * 100
 
-                params = (skip_frames, colors, quality, resize_ratio)
-                found_optimal = self._process_compression_step(
+                params = (skip_frames, colors, resize_ratio)
+                found_optimal = self.process_compression_step(
                     params,
                     frames,
                     duration,
@@ -404,7 +404,7 @@ class GIFCompressorApp:
 
         return successful_combinations
 
-    def _get_validated_max_size(self):
+    def get_validated_max_size(self):
         """Validate and return max size in MB."""
         try:
             max_size_mb = float(self.max_size_mb.get())
@@ -415,7 +415,7 @@ class GIFCompressorApp:
             self.log("Error: Invalid max size value. Please enter a number")
         return None
 
-    def _validate_input_file(self, input_path):
+    def validate_input_file(self, input_path):
         """Check if the input file exists and is not too large."""
         if not os.path.isfile(input_path):
             self.log("Error: Input GIF not found")
@@ -424,8 +424,8 @@ class GIFCompressorApp:
         try:
             file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
             if file_size_mb > 100 and not messagebox.askyesno(
-                    "Large File Warning",
-                    f"Input GIF is {file_size_mb:.1f}MB. Compression may be slow or fail. Continue?",
+                "Large File Warning",
+                f"Input GIF is {file_size_mb:.1f}MB. Compression may be slow or fail. Continue?",
             ):
                 self.log("Compression cancelled due to large file size")
                 return False
@@ -434,7 +434,7 @@ class GIFCompressorApp:
             return False
         return True
 
-    def _validate_gif_content(self, input_path):
+    def validate_gif_content(self, input_path):
         """Verify GIF is animated and check frame count."""
         try:
             with Image.open(input_path) as gif:
@@ -445,8 +445,8 @@ class GIFCompressorApp:
                     self.log("Error: Input GIF contains no frames")
                     return False
                 if gif.n_frames > 1000 and not messagebox.askyesno(
-                        "High Frame Count Warning",
-                        f"Input GIF has {gif.n_frames} frames. Compression may be slow. Continue?",
+                    "High Frame Count Warning",
+                    f"Input GIF has {gif.n_frames} frames. Compression may be slow. Continue?",
                 ):
                     self.log("Compression cancelled due to high frame count")
                     return False
@@ -455,7 +455,7 @@ class GIFCompressorApp:
             return False
         return True
 
-    def _ensure_output_directory(self, output_path):
+    def ensure_output_directory(self, output_path):
         """Ensure the output directory exists and is writable."""
         output_dir = os.path.dirname(output_path) or "."
         self.log(f"Output directory: {output_dir}")
@@ -479,44 +479,79 @@ class GIFCompressorApp:
         return True
 
     @staticmethod
-    def _cleanup_temp_files(combinations):
+    def cleanup_temp_files(combinations):
         """Remove all temporary files from the combinations list."""
         if not combinations:
             return
         for item in combinations:
             try:
-                temp_path = item[6]
+                temp_path = item[5]
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
             except OSError:
                 pass
 
-    def _save_best_result(self, successful_combinations, output_path, duration):
-        """Save the best compression result."""
-        best_combination = max(
-            successful_combinations, key=lambda x: (x[0], x[2], not x[3], x[4], x[5])
+    @staticmethod
+    def score_combination(combination):
+        """
+        Score a compression combination to determine the 'best' one.
+
+        The goal is to select the highest-quality GIF that still fits under the target size.
+        Priority order (highest first):
+
+        1. Largest file size (closer to target is better, but ≤ target)
+        2. Highest resolution (largest resize_ratio)
+        3. No frame skipping (False > True)
+        4. More colors (higher palette size preserves quality better)
+
+        Args:
+            combination: Tuple of (size, frames, resize_ratio, skip_frames, colors, temp_path)
+
+        Returns:
+            Tuple of scoring criteria in descending order of importance.
+            Higher values are preferred.
+        """
+        size, _, resize_ratio, skip_frames, colors, _ = combination
+        return (
+            size,  # Maximize size (but already ≤ target)
+            resize_ratio,  # Prefer higher resolution
+            not skip_frames,  # Prefer keeping all frames (True if not skipped)
+            colors,  # Prefer richer palette
         )
+
+    def save_best_result(self, successful_combinations, output_path, duration):
+        """Save the best compression result."""
+        if not successful_combinations:
+            self.log("No valid compressed versions met the size requirement.")
+            return
+
+        # Find the combination with the highest score according to our criteria
+        best_combination = max(
+            successful_combinations, key=GIFCompressorApp.score_combination
+        )
+
         (
             _,
             best_frames,
             best_resize_ratio,
             best_skip_frames,
             best_colors,
-            best_quality,
             temp_path,
         ) = best_combination
         self.log(
-            f"Saving final GIF with settings: resize_ratio={best_resize_ratio * 100:.1f}%, skip_frames={best_skip_frames}, colors={best_colors}, quality={best_quality}"
+            f"Saving final GIF with settings: resize_ratio={best_resize_ratio * 100:.1f}%, "
+            f"skip_frames={best_skip_frames}, colors={best_colors}"
         )
-        try:
 
+        try:
             if os.path.exists(output_path):
                 try:
                     os.remove(output_path)
                 except OSError:
                     pass
             os.rename(temp_path, output_path)
-        except OSError:
+        except OSError as e:
+            self.log(f"Could not rename temp file: {e}. Falling back to direct save.")
             best_frames[0].save(
                 output_path,
                 save_all=True,
@@ -524,10 +559,11 @@ class GIFCompressorApp:
                 duration=duration * 1000,
                 loop=0,
                 optimize=True,
-                quality=best_quality,
+                subrectangles=True,
+                dither=0,
             )
 
-        self._cleanup_temp_files(successful_combinations)
+        self.cleanup_temp_files(successful_combinations)
 
         final_size = os.path.getsize(output_path)
         self.log(f"Success! Output GIF size: {final_size / (1024 * 1024):.2f}MB")
@@ -540,9 +576,9 @@ class GIFCompressorApp:
         output_path = self.output_path.get()
         successful_combinations = []
 
-        max_size_mb = self._get_validated_max_size()
+        max_size_mb = self.get_validated_max_size()
         if max_size_mb is None:
-            self._reset_ui()
+            self.reset_ui()
             return
 
         self.status_text.delete(1.0, tk.END)
@@ -550,16 +586,16 @@ class GIFCompressorApp:
         self.log(f"Output path: {output_path}")
         self.log(f"Target max size: {max_size_mb}MB")
 
-        if not self._validate_input_file(input_path):
-            self._reset_ui()
+        if not self.validate_input_file(input_path):
+            self.reset_ui()
             return
 
-        if not self._validate_gif_content(input_path):
-            self._reset_ui()
+        if not self.validate_gif_content(input_path):
+            self.reset_ui()
             return
 
-        if not self._ensure_output_directory(output_path):
-            self._reset_ui()
+        if not self.ensure_output_directory(output_path):
+            self.reset_ui()
             return
 
         try:
@@ -571,33 +607,33 @@ class GIFCompressorApp:
             duration = gif.info.get("duration", 100) / 1000.0
             self.log(f"Frame duration: {duration} seconds")
 
-            successful_combinations = self._find_best_compression_combination(
+            successful_combinations = self.find_best_compression_combination(
                 original_frames, duration, max_size_mb, output_path
             )
 
             if not self.is_compressing:
-                self._cleanup_temp_files(successful_combinations)
-                self._reset_ui()
+                self.cleanup_temp_files(successful_combinations)
+                self.reset_ui()
                 return
 
             if successful_combinations:
-                self._save_best_result(successful_combinations, output_path, duration)
+                self.save_best_result(successful_combinations, output_path, duration)
             else:
                 self.log(f"Warning: Could not reduce size below {max_size_mb}MB")
 
                 self.log("No combinations were successful under the target size.")
 
-            self._reset_ui(success=True)
+            self.reset_ui(success=True)
 
         except InterruptedError:
-            self._cleanup_temp_files(successful_combinations)
-            self._reset_ui()
+            self.cleanup_temp_files(successful_combinations)
+            self.reset_ui()
         except Exception as e:
             self.log(f"Error processing GIF: {str(e)}")
-            self._cleanup_temp_files(successful_combinations)
-            self._reset_ui()
+            self.cleanup_temp_files(successful_combinations)
+            self.reset_ui()
 
-    def _reset_ui(self, success=False):
+    def reset_ui(self, success=False):
         """Reset the UI state after compression."""
         self.is_compressing = False
         self.compress_button.config(state="normal")
@@ -611,7 +647,38 @@ class GIFCompressorApp:
             self.progress_label.config(text="Ready")
 
 
+def _test_scoring_logic():
+    """Test that score_combination selects the expected best combination."""
+    # Sample successful combinations: (size_bytes, frames, resize_ratio, skip_frames, colors, temp_path)
+    combos = [
+        (3_800_000, None, 0.8, True, 128, "a.gif"),  # smaller size, skipped frames
+        (3_900_000, None, 0.8, False, 128, "b.gif"),  # larger size, no skip
+        (3_850_000, None, 0.9, True, 256, "c.gif"),  # higher res, but skipped
+        (3_870_000, None, 0.8, False, 256, "d.gif"),  # good size, no skip, max colors
+        (
+            3_950_000,
+            None,
+            0.9,
+            False,
+            256,
+            "e.gif",
+        ),  # the largest size, highest res, no skip, max colors
+    ]
+
+    best = max(combos, key=GIFCompressorApp.score_combination)
+    assert (
+        best == combos[4]
+    ), "Scoring failed: expected highest res + no skip + max colors + largest size to win"
+
+    print("✓ Scoring logic test passed: best combination selected correctly.")
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = GIFCompressorApp(root)
-    root.mainloop()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        _test_scoring_logic()
+    else:
+        root = tk.Tk()
+        app = GIFCompressorApp(root)
+        root.mainloop()
